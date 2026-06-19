@@ -153,6 +153,7 @@ pub struct Runner<L: Language, N: Analysis<L>, IterData = ()> {
 
     limits: RunnerLimits,
     scheduler: Box<dyn RewriteScheduler<L, N>>,
+    gc: bool,
 }
 
 /// Describes the limits that would stop a [`Runner`].
@@ -215,6 +216,7 @@ where
             hooks,
             limits,
             scheduler: _,
+            gc,
         } = self;
 
         f.debug_struct("Runner")
@@ -225,6 +227,7 @@ where
             .field("hooks", &vec![format_args!("<dyn FnMut ..>"); hooks.len()])
             .field("limits", limits)
             .field("scheduler", &format_args!("<dyn RewriteScheduler ..>"))
+            .field("gc", gc)
             .finish()
     }
 }
@@ -354,6 +357,7 @@ where
             stop_reason: None,
             hooks: vec![],
             scheduler: Box::new(BackoffScheduler::default()),
+            gc: false,
         }
     }
 
@@ -428,6 +432,18 @@ where
     /// Replace the [`EGraph`] of this `Runner`.
     pub fn with_egraph(self, egraph: EGraph<L, N>) -> Self {
         Self { egraph, ..self }
+    }
+
+    /// Enable garbage collection of unreachable e-classes after each rebuild.
+    ///
+    /// When enabled, the runner will call [`remove_unreachable`] after each
+    /// iteration's rebuild, removing e-classes not reachable from [`roots`](Runner::roots).
+    /// This can reduce e-graph size but may break rewrites that rely on
+    /// synthetic eclasses persisting across iterations
+    /// (e.g. [`ConditionEqual`](crate::ConditionEqual)).
+    pub fn with_gc(mut self) -> Self {
+        self.gc = true;
+        self
     }
 
     /// Run this `Runner` until it stops.
@@ -598,6 +614,14 @@ where
         let n_rebuilds = self.egraph.rebuild();
         if self.egraph.are_explanations_enabled() {
             debug_assert!(self.egraph.check_each_explain(rules));
+        }
+
+        if self.gc && !self.roots.is_empty() {
+            let removed_classes = remove_unreachable(&mut self.egraph, self.roots.iter().copied());
+            if removed_classes > 0 {
+                info!("Removed {removed_classes} unreachable e-classes");
+                self.egraph.rebuild();
+            }
         }
 
         let rebuild_time = rebuild_time.elapsed().as_secs_f64();
@@ -1076,11 +1100,10 @@ where
             let total_len: usize = matches.iter().map(|m| m.substs.len()).sum();
 
             if total_len > threshold {
-                info!("Pending rewrite undo: {} (applied {}, undone {}, last undone on {}): {threshold} < {total_len}",
-                    rw.name,
-                    stats.times_applied,
-                    stats.times_undone,
-                    stats.last_iteration_undone);
+                info!(
+                    "Pending rewrite undo: {} (applied {}, undone {}, last undone on {}): {threshold} < {total_len}",
+                    rw.name, stats.times_applied, stats.times_undone, stats.last_iteration_undone
+                );
 
                 // Immediately undoing rewrites could result in a broken e-graph, since matches
                 // haven't yet been applied. Instead, these rewrites will be undone immediately

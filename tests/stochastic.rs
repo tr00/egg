@@ -2,7 +2,6 @@ use egg::*;
 
 type CostRewrite = Rewrite<Expr, WeightedCost<Expr>>;
 
-
 define_language! {
     enum Expr {
         Num(i32),
@@ -24,12 +23,7 @@ fn weight(enode: &Expr) -> f64 {
 fn sr(name: &str, lhs: &str, rhs: &str) -> CostRewrite {
     let searcher: Pattern<Expr> = lhs.parse().unwrap();
     let applier: Pattern<Expr> = rhs.parse().unwrap();
-    Rewrite::new(
-        name,
-        searcher,
-        StochasticApplier::from_pattern(applier),
-    )
-    .unwrap()
+    Rewrite::new(name, searcher, StochasticApplier::from_pattern(applier)).unwrap()
 }
 
 /// Commutative-ring axioms plus cancellation and double-negation.
@@ -65,12 +59,11 @@ fn rules() -> Vec<CostRewrite> {
 /// cheapest extraction (string) together with its cached cost.
 fn optimize(input: &str) -> (String, f64) {
     let expr: RecExpr<Expr> = input.parse().unwrap();
-    let runner: Runner<Expr, WeightedCost<Expr>> =
-        Runner::new(WeightedCost::new(weight))
-            .with_expr(&expr)
-            .with_iter_limit(30)
-            .with_node_limit(50_000)
-            .run(&rules());
+    let runner: Runner<Expr, WeightedCost<Expr>> = Runner::new(WeightedCost::new(weight))
+        .with_expr(&expr)
+        .with_iter_limit(30)
+        .with_node_limit(50_000)
+        .run(&rules());
     let root = runner.roots[0];
     let best_cost = runner.egraph[root].data.clone().unwrap();
     let extractor = Extractor::new(&runner.egraph, AstSize);
@@ -237,7 +230,6 @@ fn strassen_identity() {
     assert_eq!(s.matches("(* ").count(), 2, "expected 2 muls in: {s}");
 }
 
-
 /// Verify StochasticApplier can wrap ConditionalApplier.
 #[test]
 fn stochastic_conditional_compose() {
@@ -245,7 +237,9 @@ fn stochastic_conditional_compose() {
     let rhs: Pattern<Expr> = "(+ ?b ?a)".parse().unwrap();
 
     let cond_applier = ConditionalApplier {
-        condition: |_egraph: &mut EGraph<Expr, WeightedCost<Expr>>, _eclass: Id, _subst: &Subst| true,
+        condition: |_egraph: &mut EGraph<Expr, WeightedCost<Expr>>, _eclass: Id, _subst: &Subst| {
+            true
+        },
         applier: rhs.clone(),
     };
     let stochastic = StochasticApplier::new(rhs, cond_applier);
