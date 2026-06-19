@@ -927,6 +927,137 @@ pub fn merge_option<T>(
     }
 }
 
+/// An additive, weighted [`Analysis`] that caches the best cost per e-class.
+///
+/// You provide a `weight` function that returns the cost of each operator
+/// (ignoring children). The analysis computes the total cost bottom-up as
+/// `weight(enode) + sum(child costs)`. When e-classes merge, the minimum
+/// cost wins.
+///
+/// `WeightedCost` implements `Analysis`, so it caches costs in
+/// `EClass::data` and they stay up-to-date after `EGraph::rebuild`.
+///
+/// Costs are `f64` values. When e-classes merge, the minimum cost wins
+/// (via `f64::total_cmp`).
+///
+/// # Example
+///
+/// ```
+/// use egg::*;
+///
+/// define_language! {
+///     enum Arith {
+///         Num(i32),
+///         "+" = Add([Id; 2]),
+///         "*" = Mul([Id; 2]),
+///         Symbol(Symbol),
+///     }
+/// }
+///
+/// // Prefer multiplications over additions by giving "+" a higher weight.
+/// type CostGraph = EGraph<Arith, WeightedCost<Arith>>;
+/// let cost_fn = WeightedCost::new(|enode: &Arith| match enode {
+///     Arith::Add(_) => 3.0,
+///     Arith::Mul(_) => 1.0,
+///     _ => 1.0,
+/// });
+/// ```
+pub struct WeightedCost<L: Language> {
+    weight: Box<dyn Fn(&L) -> f64>,
+}
+
+impl<L: Language> WeightedCost<L> {
+    /// Create a new `WeightedCost` from a function that returns the
+    /// weight of each operator. Children costs are added automatically.
+    pub fn new(weight: impl Fn(&L) -> f64 + 'static) -> Self {
+        WeightedCost {
+            weight: Box::new(weight),
+        }
+    }
+}
+
+impl<L: Language> WeightedCost<L> {
+    /// Extract the cheapest expression from the e-graph starting at `root`.
+    ///
+    /// The e-graph must have been [`rebuild`]ed so that `EClass::data`
+    /// (the cached costs) is up-to-date. Returns `None` if the root or
+    /// any reachable child lacks a computed cost.
+    ///
+    /// This is a greedy, bottom-up extraction: it picks the minimum-cost
+    /// enode in each e-class. Because `WeightedCost` is additive and
+    /// monotonic, this is optimal.
+    ///
+    /// [`rebuild`]: EGraph::rebuild
+    pub fn extract(egraph: &EGraph<L, Self>, root: Id) -> Option<(f64, RecExpr<L>)> {
+        let root = egraph.find(root);
+        let _ = egraph[root].data.as_ref()?;
+
+        let mut cache = HashMap::<Id, L>::default();
+
+        let cost = |node: &L| -> Option<f64> {
+            let w = (egraph.analysis.weight)(node);
+            let sum = node.fold(Some(0.0_f64), |acc, child_id| {
+                let a = acc?;
+                let c = egraph[egraph.find(child_id)].data.as_ref()?;
+                Some(a + c)
+            });
+            sum.map(|s| w + s)
+        };
+
+        let mut find_best_node = |id: Id| -> L {
+            let canon = egraph.find(id);
+            cache
+                .entry(canon)
+                .or_insert_with(|| {
+                    egraph[canon]
+                        .iter()
+                        .min_by(|a, b| cost(a).unwrap().total_cmp(&cost(b).unwrap()))
+                        .unwrap()
+                        .clone()
+                })
+                .clone()
+        };
+
+        let best = find_best_node(root);
+        let total = cost(&best)?;
+        let expr = best.build_recexpr(find_best_node);
+        Some((total, expr))
+    }
+}
+
+impl<L: Language> Analysis<L> for WeightedCost<L> {
+    type Data = Option<f64>;
+
+    fn make(egraph: &mut EGraph<L, Self>, enode: &L, _id: Id) -> Self::Data {
+        let w = (egraph.analysis.weight)(enode);
+        let sum = enode.fold(Some(0.0_f64), |acc, child_id| {
+            let a = acc?;
+            let c = egraph[child_id].data.as_ref()?;
+            Some(a + c)
+        });
+        sum.map(|s| w + s)
+    }
+
+    fn merge(&mut self, to: &mut Self::Data, from: Self::Data) -> DidMerge {
+        match (to.as_mut(), from) {
+            (None, None) => DidMerge(false, false),
+            (Some(_), None) => DidMerge(false, true),
+            (None, Some(from)) => {
+                *to = Some(from);
+                DidMerge(true, false)
+            }
+            (Some(a), Some(b)) => {
+                if b.total_cmp(a).is_lt() {
+                    *a = b;
+                    DidMerge(true, false)
+                } else {
+                    DidMerge(false, true)
+                }
+            }
+        }
+    }
+}
+
 /// A simple language used for testing.
 #[derive(Debug, Hash, PartialEq, Eq, Clone, PartialOrd, Ord)]
 #[cfg_attr(feature = "serde-1", derive(serde::Serialize, serde::Deserialize))]
@@ -984,5 +1115,111 @@ impl FromOp for SymbolLang {
             op: op.into(),
             children,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    define_language! {
+        enum TestLang {
+            Num(i32),
+            "+" = Add([Id; 2]),
+            "*" = Mul([Id; 2]),
+            Symbol(Symbol),
+        }
+    }
+
+    type CostGraph = EGraph<TestLang, WeightedCost<TestLang>>;
+
+    #[test]
+    fn weighted_cost_extract_picks_cheaper() {
+        // Weight Add at 3, Mul at 1, leaves at 1.
+        // (+ 1 1) costs 3+1+1 = 5, (* 1 1) costs 1+1+1 = 3.
+        let cost_fn = WeightedCost::new(|enode: &TestLang| match enode {
+            TestLang::Add(_) => 3.0,
+            TestLang::Mul(_) => 1.0,
+            _ => 1.0,
+        });
+        let mut egraph = CostGraph::new(cost_fn);
+
+        let one = egraph.add(TestLang::Num(1));
+        let add = egraph.add(TestLang::Add([one, one]));
+        let mul = egraph.add(TestLang::Mul([one, one]));
+        egraph.union(add, mul);
+        egraph.rebuild();
+
+        let (cost, expr) = WeightedCost::extract(&egraph, add).unwrap();
+        assert_eq!(cost, 3.0);
+        // build_recexpr deduplicates: Num(1) appears once, both Mul children are index 0
+        let mut expected = RecExpr::default();
+        expected.add(TestLang::Num(1));
+        expected.add(TestLang::Mul([0.into(), 0.into()]));
+        assert_eq!(expr, expected);
+    }
+
+    #[test]
+    fn weighted_cost_extract_nested() {
+        let cost_fn = WeightedCost::new(|enode: &TestLang| match enode {
+            TestLang::Add(_) => 2.0,
+            _ => 1.0,
+        });
+        let mut egraph = CostGraph::new(cost_fn);
+
+        // Build (+ (+ 1 2) 3) — cost: 2 + (2+1+1) + 1 = 7
+        let one = egraph.add(TestLang::Num(1));
+        let two = egraph.add(TestLang::Num(2));
+        let three = egraph.add(TestLang::Num(3));
+        let inner = egraph.add(TestLang::Add([one, two]));
+        let outer = egraph.add(TestLang::Add([inner, three]));
+        egraph.rebuild();
+
+        let (cost, expr) = WeightedCost::extract(&egraph, outer).unwrap();
+        assert_eq!(cost, 7.0);
+        // build_recexpr processes children in reverse visit order, deduplicating
+        let mut expected = RecExpr::default();
+        let e3 = expected.add(TestLang::Num(3));
+        let e2 = expected.add(TestLang::Num(2));
+        let e1 = expected.add(TestLang::Num(1));
+        let inner_e = expected.add(TestLang::Add([e1, e2]));
+        expected.add(TestLang::Add([inner_e, e3]));
+        assert_eq!(expr, expected);
+    }
+
+    #[test]
+    fn weighted_cost_extract_leaf() {
+        let cost_fn = WeightedCost::new(|_enode: &TestLang| 42.0_f64);
+        let mut egraph = CostGraph::new(cost_fn);
+
+        let id = egraph.add(TestLang::Num(5));
+        egraph.rebuild();
+
+        let (cost, expr) = WeightedCost::extract(&egraph, id).unwrap();
+        assert_eq!(cost, 42.0);
+        assert_eq!(expr, "5".parse::<RecExpr<TestLang>>().unwrap());
+    }
+
+    #[test]
+    fn weighted_cost_extract_shared_children() {
+        // Verify DAG sharing: the child is only counted once in the RecExpr.
+        let cost_fn = WeightedCost::new(|_enode: &TestLang| 1.0_f64);
+        let mut egraph = CostGraph::new(cost_fn);
+
+        let a = egraph.add(TestLang::Num(1));
+        // (a + a) + (a + a) — all references to the same child
+        let left = egraph.add(TestLang::Add([a, a]));
+        let right = egraph.add(TestLang::Add([a, a]));
+        // left and right are the same eclass (congruence)
+        let root = egraph.add(TestLang::Add([left, right]));
+        egraph.rebuild();
+
+        let (cost, expr) = WeightedCost::extract(&egraph, root).unwrap();
+        // root=1, left/right=1+1+1=3, a=1 => total 1+3+3 = 7
+        // but left and right merge, so root = 1 + 3 + 3 = 7
+        assert_eq!(cost, 7.0);
+        // RecExpr deduplicates: `a` appears once, `left`/`right` are the same
+        let nodes: Vec<_> = expr.as_ref().iter().collect();
+        assert_eq!(nodes.len(), 3); // Num(1), Add(a,a), Add(left,left)
     }
 }

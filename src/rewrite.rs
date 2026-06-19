@@ -1,4 +1,5 @@
 use pattern::apply_pat;
+use rand::Rng;
 use std::fmt::{self, Debug, Display};
 use std::sync::Arc;
 
@@ -446,6 +447,149 @@ where
         let mut vars = self.applier.vars();
         vars.extend(self.condition.vars());
         vars
+    }
+}
+
+/// An [`Applier`] that probabilistically applies a [`Pattern`] based on
+/// cost changes, using simulated annealing.
+///
+/// `StochasticApplier` is bound to [`WeightedCost`] analysis and applies
+/// rewrites with probability determined by the cost difference between the
+/// matched e-class and the newly instantiated expression:
+///
+/// - **Always accepts** improvements (cost reductions)
+/// - **Probabilistically accepts** regressions based on temperature
+///
+/// The acceptance formula follows simulated annealing (Metropolis-Hastings):
+/// - If Δcost ≤ 0: accept with probability 1.0
+/// - If Δcost > 0: accept with probability exp(-Δcost / temperature)
+///
+/// # Example
+///
+/// ```
+/// use egg::*;
+///
+/// define_language! {
+///     enum Math {
+///         Num(i32),
+///         "+" = Add([Id; 2]),
+///         "*" = Mul([Id; 2]),
+///         Symbol(Symbol),
+///     }
+/// }
+///
+/// type CostGraph = EGraph<Math, WeightedCost<Math>>;
+///
+/// let cost_fn = WeightedCost::new(|enode: &Math| match enode {
+///     Math::Mul(_) => 1.0,
+///     _ => 2.0,
+/// });
+/// let mut egraph = CostGraph::new(cost_fn);
+///
+/// let rhs: Pattern<Math> = "(+ ?b ?a)".parse().unwrap();
+/// // Temperature = 1.0 means moderate exploration
+/// let applier = StochasticApplier::with_temperature(rhs, 1.0);
+/// ```
+pub struct StochasticApplier<L: Language> {
+    /// The pattern to apply.
+    pub pattern: Pattern<L>,
+    /// Temperature parameter controlling exploration/exploitation trade-off.
+    /// Higher values accept more cost increases; lower values are more selective.
+    pub temperature: f64,
+}
+
+impl<L: Language + FromOp> StochasticApplier<L> {
+    /// Create a new `StochasticApplier` with default temperature of 1.0.
+    pub fn new(pattern: Pattern<L>) -> Self {
+        Self::with_temperature(pattern, 1.0)
+    }
+
+    /// Create a `StochasticApplier` with a specific temperature.
+    ///
+    /// Temperature controls how willing the applier is to accept cost increases:
+    /// - `temperature = 0.0`: Only accept improvements (deterministic)
+    /// - `temperature = 1.0`: Moderate exploration (default)
+    /// - `temperature > 1.0`: More aggressive exploration
+    pub fn with_temperature(pattern: Pattern<L>, temperature: f64) -> Self {
+        Self {
+            pattern,
+            temperature,
+        }
+    }
+}
+
+impl<L: Language + FromOp> StochasticApplier<L> {
+    /// Compute acceptance probability using simulated annealing.
+    ///
+    /// Returns a probability in [0.0, 1.0] based on the cost difference:
+    /// - If new cost ≤ old cost: returns 1.0 (always accept improvements)
+    /// - If new cost > old cost: returns exp(-Δcost / temperature)
+    fn accept_probability(&self, old_cost: f64, new_cost: f64) -> f64 {
+        let delta = new_cost - old_cost;
+
+        if delta <= 0.0 {
+            1.0 // Always accept improvements
+        } else {
+            (-delta / self.temperature).exp() // Probabilistically accept regressions
+        }
+    }
+}
+
+impl<L: Language + FromOp> Applier<L, WeightedCost<L>> for StochasticApplier<L> {
+    fn get_pattern_ast(&self) -> Option<&PatternAst<L>> {
+        Some(&self.pattern.ast)
+    }
+
+    fn apply_one(
+        &self,
+        egraph: &mut EGraph<L, WeightedCost<L>>,
+        eclass: Id,
+        subst: &Subst,
+        searcher_ast: Option<&PatternAst<L>>,
+        rule_name: Symbol,
+    ) -> Vec<Id> {
+        // Instantiate the pattern to get the new expression
+        let mut id_buf = vec![0.into(); self.pattern.ast.len()];
+        let new_id = apply_pat(&mut id_buf, &self.pattern.ast, egraph, subst);
+
+        // Get the minimum costs from both e-classes
+        let eclass_canon = egraph.find(eclass);
+        let new_id_canon = egraph.find(new_id);
+
+        let old_cost = &egraph[eclass_canon].data;
+        let new_cost = &egraph[new_id_canon].data;
+
+        // Decide whether to accept based on costs
+        let accept = match (old_cost, new_cost) {
+            (Some(old), Some(new)) => {
+                let prob = self.accept_probability(*old, *new);
+                let mut rng = rand::thread_rng();
+                let roll: f64 = rng.r#gen();
+                roll < prob
+            }
+            // If costs are unavailable, accept by default (graceful degradation)
+            _ => true,
+        };
+
+        if !accept {
+            // Pattern was instantiated but union rejected
+            return vec![];
+        }
+
+        // Standard union logic (same as Pattern applier)
+        if let Some(ast) = searcher_ast {
+            let (from, did_something) =
+                egraph.union_instantiations(ast, &self.pattern.ast, subst, rule_name);
+            if did_something { vec![from] } else { vec![] }
+        } else if egraph.union(eclass, new_id) {
+            vec![eclass]
+        } else {
+            vec![]
+        }
+    }
+
+    fn vars(&self) -> Vec<Var> {
+        self.pattern.vars()
     }
 }
 
