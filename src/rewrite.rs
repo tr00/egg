@@ -450,15 +450,19 @@ where
     }
 }
 
-/// An [`Applier`] that probabilistically applies a [`Pattern`] based on
+/// An [`Applier`] that probabilistically gates application based on
 /// cost changes, using simulated annealing.
 ///
-/// `StochasticApplier` is bound to [`WeightedCost`] analysis and applies
-/// rewrites with probability determined by the cost difference between the
-/// matched e-class and the newly instantiated expression:
+/// `StochasticApplier` wraps an inner [`Applier`] (defaulting to [`Pattern<L>`])
+/// and only delegates to it when the cost gate passes. This makes it a
+/// composable probabilistic filter — wrap any applier stack inside it:
 ///
-/// - **Always accepts** improvements (cost reductions)
-/// - **Probabilistically accepts** regressions based on temperature
+/// ```ignore
+/// StochasticApplier<ConditionalApplier<Cond, Pattern<L>>>
+/// ```
+///
+/// The cost gate works by instantiating a [`Pattern`] to read costs before
+/// deciding whether to apply. The inner applier performs the actual union.
 ///
 /// The acceptance formula follows simulated annealing (Metropolis-Hastings):
 /// - If Δcost ≤ 0: accept with probability 1.0
@@ -488,37 +492,48 @@ where
 ///
 /// let rhs: Pattern<Math> = "(+ ?b ?a)".parse().unwrap();
 /// // Temperature = 1.0 means moderate exploration
-/// let applier = StochasticApplier::with_temperature(rhs, 1.0);
+/// let applier = StochasticApplier::from_pattern_with_temperature(rhs, 1.0);
 /// ```
-pub struct StochasticApplier<L: Language> {
-    /// The pattern to apply.
+pub struct StochasticApplier<L: Language, A = Pattern<L>> {
+    /// The pattern used for cost-checking. Instantiated to read costs
+    /// before deciding whether to apply.
     pub pattern: Pattern<L>,
+    /// The inner applier that performs the actual application.
+    pub inner: A,
     /// Temperature parameter controlling exploration/exploitation trade-off.
     /// Higher values accept more cost increases; lower values are more selective.
     pub temperature: f64,
 }
 
 impl<L: Language + FromOp> StochasticApplier<L> {
-    /// Create a new `StochasticApplier` with default temperature of 1.0.
-    pub fn new(pattern: Pattern<L>) -> Self {
-        Self::with_temperature(pattern, 1.0)
+    /// Create a `StochasticApplier` from a single pattern. The pattern is
+    /// used for both cost-checking and application (wraps itself as inner).
+    pub fn from_pattern(pattern: Pattern<L>) -> Self {
+        Self::with_temperature(pattern.clone(), pattern, 1.0)
     }
 
-    /// Create a `StochasticApplier` with a specific temperature.
-    ///
-    /// Temperature controls how willing the applier is to accept cost increases:
-    /// - `temperature = 0.0`: Only accept improvements (deterministic)
-    /// - `temperature = 1.0`: Moderate exploration (default)
-    /// - `temperature > 1.0`: More aggressive exploration
-    pub fn with_temperature(pattern: Pattern<L>, temperature: f64) -> Self {
-        Self {
-            pattern,
-            temperature,
-        }
+    /// Create a `StochasticApplier` from a pattern with custom temperature.
+    pub fn from_pattern_with_temperature(pattern: Pattern<L>, temperature: f64) -> Self {
+        Self::with_temperature(pattern.clone(), pattern, temperature)
     }
 }
 
-impl<L: Language + FromOp> StochasticApplier<L> {
+impl<L: Language, A: Applier<L, WeightedCost<L>>> StochasticApplier<L, A> {
+    /// Create a new `StochasticApplier` wrapping an inner applier,
+    /// with default temperature of 1.0.
+    pub fn new(pattern: Pattern<L>, inner: A) -> Self {
+        Self::with_temperature(pattern, inner, 1.0)
+    }
+
+    /// Create a `StochasticApplier` wrapping an inner applier
+    /// with a specific temperature.
+    pub fn with_temperature(pattern: Pattern<L>, inner: A, temperature: f64) -> Self {
+        Self { pattern, inner, temperature }
+    }
+}
+
+
+impl<L: Language, A> StochasticApplier<L, A> {
     /// Compute acceptance probability using simulated annealing.
     ///
     /// Returns a probability in [0.0, 1.0] based on the cost difference:
@@ -535,7 +550,11 @@ impl<L: Language + FromOp> StochasticApplier<L> {
     }
 }
 
-impl<L: Language + FromOp> Applier<L, WeightedCost<L>> for StochasticApplier<L> {
+impl<L, A> Applier<L, WeightedCost<L>> for StochasticApplier<L, A>
+where
+    L: Language,
+    A: Applier<L, WeightedCost<L>>,
+{
     fn get_pattern_ast(&self) -> Option<&PatternAst<L>> {
         Some(&self.pattern.ast)
     }
@@ -548,18 +567,17 @@ impl<L: Language + FromOp> Applier<L, WeightedCost<L>> for StochasticApplier<L> 
         searcher_ast: Option<&PatternAst<L>>,
         rule_name: Symbol,
     ) -> Vec<Id> {
-        // Instantiate the pattern to get the new expression
+        // Instantiate the pattern to make costs available
         let mut id_buf = vec![0.into(); self.pattern.ast.len()];
         let new_id = apply_pat(&mut id_buf, &self.pattern.ast, egraph, subst);
 
-        // Get the minimum costs from both e-classes
+        // Read costs
         let eclass_canon = egraph.find(eclass);
         let new_id_canon = egraph.find(new_id);
-
         let old_cost = &egraph[eclass_canon].data;
         let new_cost = &egraph[new_id_canon].data;
 
-        // Decide whether to accept based on costs
+        // Annealing gate
         let accept = match (old_cost, new_cost) {
             (Some(old), Some(new)) => {
                 let prob = self.accept_probability(*old, *new);
@@ -576,15 +594,84 @@ impl<L: Language + FromOp> Applier<L, WeightedCost<L>> for StochasticApplier<L> 
             return vec![];
         }
 
-        // Standard union logic (same as Pattern applier)
-        if let Some(ast) = searcher_ast {
-            let (from, did_something) =
-                egraph.union_instantiations(ast, &self.pattern.ast, subst, rule_name);
-            if did_something { vec![from] } else { vec![] }
-        } else if egraph.union(eclass, new_id) {
-            vec![eclass]
-        } else {
-            vec![]
+        // Delegate to inner applier
+        self.inner.apply_one(egraph, eclass, subst, searcher_ast, rule_name)
+    }
+
+    fn vars(&self) -> Vec<Var> {
+        self.pattern.vars()
+    }
+}
+
+/// An [`Applier`] that removes the matched top e-node instead of adding one.
+///
+/// On match, the top e-node of the pattern is looked up via the substitution.
+/// If the e-class would still have a ground term after removal, the e-node is
+/// removed from the e-class and the memo table.
+///
+/// Explanations mode is not supported and will panic.
+///
+/// # Example
+/// ```
+/// use egg::*;
+///
+/// define_language! {
+///     enum Math {
+///         Num(i32),
+///         "+" = Add([Id; 2]),
+///         Symbol(Symbol),
+///     }
+/// }
+///
+/// let mut egraph = EGraph::<Math, ()>::default();
+/// let a = egraph.add(Math::Num(1));
+/// let b = egraph.add(Math::Num(2));
+/// let ab = egraph.add(Math::Add([a, b]));
+/// let ba = egraph.add(Math::Add([b, a]));
+/// egraph.union(ab, ba);
+/// egraph.rebuild();
+///
+/// // Eclass has both (+ 1 2) and (+ 2 1); removing one leaves a ground term.
+/// let searcher: Pattern<Math> = "(+ ?a ?b)".parse().unwrap();
+/// let applier = RemoveApplier::new("(+ ?a ?b)".parse().unwrap());
+/// let rw = Rewrite::new("remove-add", searcher, applier).unwrap();
+///
+/// let matches = rw.search(&egraph);
+/// let changed = rw.apply(&mut egraph, &matches);
+/// assert_eq!(changed.len(), 1);
+/// ```
+pub struct RemoveApplier<L: Language> {
+    /// The pattern whose top e-node will be removed on match.
+    pub pattern: Pattern<L>,
+}
+
+impl<L: Language> RemoveApplier<L> {
+    /// Create a new `RemoveApplier` for the given pattern.
+    pub fn new(pattern: Pattern<L>) -> Self {
+        Self { pattern }
+    }
+}
+
+impl<L: Language, N: Analysis<L>> Applier<L, N> for RemoveApplier<L> {
+    fn get_pattern_ast(&self) -> Option<&PatternAst<L>> {
+        Some(&self.pattern.ast)
+    }
+
+    fn apply_one(
+        &self,
+        egraph: &mut EGraph<L, N>,
+        _eclass: Id,
+        subst: &Subst,
+        _searcher_ast: Option<&PatternAst<L>>,
+        _rule_name: Symbol,
+    ) -> Vec<Id> {
+        assert!(
+            !egraph.are_explanations_enabled(),
+            "RemoveApplier does not support explanations mode"
+        );
+        match crate::undo::remove_top_enode(egraph, &self.pattern.ast, subst) {
+            Ok(Some(changed_id)) => vec![changed_id],
+            _ => vec![],
         }
     }
 
@@ -791,5 +878,28 @@ mod tests {
         egraph.rebuild();
         fold_add.run(&mut egraph);
         assert_eq!(egraph.equivs(&start, &goal), vec![egraph.find(root)]);
+    }
+
+    #[test]
+    fn remove_applier() {
+        crate::init_logger();
+        let mut egraph = EGraph::default();
+        let a = egraph.add(S::leaf("a"));
+        let b = egraph.add(S::leaf("b"));
+        let ab = egraph.add(S::new("+", vec![a, b]));
+        let ba = egraph.add(S::new("+", vec![b, a]));
+        egraph.union(ab, ba);
+        egraph.rebuild();
+
+        // Eclass has both (+ a b) and (+ b a); removing one leaves a ground term.
+        let searcher: Pattern<S> = "(+ ?a ?b)".parse().unwrap();
+        let applier = RemoveApplier::new("(+ ?a ?b)".parse().unwrap());
+        let rw = Rewrite::new("remove-add", searcher, applier).unwrap();
+
+        let matches = rw.search(&egraph);
+        assert!(!matches.is_empty(), "should find at least one match");
+
+        let changed = rw.apply(&mut egraph, &matches);
+        assert_eq!(changed.len(), 1, "should remove exactly one enode");
     }
 }

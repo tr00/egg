@@ -27,7 +27,7 @@ fn sr(name: &str, lhs: &str, rhs: &str) -> CostRewrite {
     Rewrite::new(
         name,
         searcher,
-        StochasticApplier::<Expr>::new(applier),
+        StochasticApplier::from_pattern(applier),
     )
     .unwrap()
 }
@@ -235,4 +235,32 @@ fn strassen_identity() {
     }
     // exactly two products survived cancellation
     assert_eq!(s.matches("(* ").count(), 2, "expected 2 muls in: {s}");
+}
+
+
+/// Verify StochasticApplier can wrap ConditionalApplier.
+#[test]
+fn stochastic_conditional_compose() {
+    let searcher: Pattern<Expr> = "(+ ?a ?b)".parse().unwrap();
+    let rhs: Pattern<Expr> = "(+ ?b ?a)".parse().unwrap();
+
+    let cond_applier = ConditionalApplier {
+        condition: |_egraph: &mut EGraph<Expr, WeightedCost<Expr>>, _eclass: Id, _subst: &Subst| true,
+        applier: rhs.clone(),
+    };
+    let stochastic = StochasticApplier::new(rhs, cond_applier);
+
+    let rw = Rewrite::new("commute-stochastic-cond", searcher, stochastic).unwrap();
+    let rules = &[rw];
+
+    let expr: RecExpr<Expr> = "(+ 1 2)".parse().unwrap();
+    let mut runner = Runner::<Expr, WeightedCost<Expr>>::new(WeightedCost::new(weight))
+        .with_expr(&expr)
+        .with_iter_limit(5)
+        .run(rules);
+    // After saturation, 1+2 and 2+1 should be in the same eclass
+    let root = runner.roots[0];
+    let egraph = &mut runner.egraph;
+    let expected = egraph.add_expr(&"(+ 2 1)".parse().unwrap());
+    assert_eq!(egraph.find(root), egraph.find(expected));
 }

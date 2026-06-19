@@ -39,8 +39,9 @@ pub fn undo_rewrites<'a, L: Language + 'a, N: Analysis<L> + 'a>(
         let total_len = all_substs.len();
 
         for subst in all_substs.iter().skip(1) {
-            let removed = remove_top_enode(egraph, pattern_ast.as_ref(), subst)?;
-            enode_counter += removed as u32;
+            if remove_top_enode(egraph, pattern_ast.as_ref(), subst)?.is_some() {
+                enode_counter += 1;
+            }
         }
 
         info!(
@@ -59,11 +60,11 @@ pub fn undo_rewrites<'a, L: Language + 'a, N: Analysis<L> + 'a>(
     Ok(())
 }
 
-fn remove_top_enode<L: Language, N: Analysis<L>>(
+pub(crate) fn remove_top_enode<L: Language, N: Analysis<L>>(
     egraph: &mut EGraph<L, N>,
     pattern_ast: &[ENodeOrVar<L>],
     subst: &Subst,
-) -> Result<bool, String> {
+) -> Result<Option<Id>, String> {
     let (top_enode, children) = match pattern_ast.split_last() {
         Some((top_enode, children)) => (top_enode, children),
         None => return Err("pattern_ast should not be empty".to_string()),
@@ -83,7 +84,7 @@ fn remove_top_enode<L: Language, N: Analysis<L>>(
                 match egraph.lookup(instantiated_enode) {
                     Some(eclass_id) => eclass_id,
                     None => {
-                        return Ok(false);
+                        return Ok(None);
                     }
                 }
             }
@@ -96,7 +97,7 @@ fn remove_top_enode<L: Language, N: Analysis<L>>(
             // Rewrite is of the form "(...) => (?a)", which cannot be undone because there is no
             // e-node to undo, only two e-classes that were unioned. Since a union does not affect
             // the cost of e-matching, there is no need to undo it. TODO: is this right?
-            return Ok(false);
+            return Ok(None);
         }
         ENodeOrVar::ENode(enode) => enode
             .clone()
@@ -106,7 +107,7 @@ fn remove_top_enode<L: Language, N: Analysis<L>>(
     let eclass_id = match egraph.lookup(&mut top_enode_instantiated) {
         Some(eclass_id) => eclass_id,
         None => {
-            return Ok(false);
+            return Ok(None);
         }
     };
 
@@ -126,15 +127,15 @@ fn remove_top_enode<L: Language, N: Analysis<L>>(
                 return false;
             }
 
-            let mut iterator = eclass.nodes.iter().filter(|&enode| enode != excluded);
+            let non_excluded = |enode: &&L| *enode != excluded;
 
-            if iterator.any(|enode| enode.is_leaf()) {
+            if eclass.nodes.iter().filter(non_excluded).any(|enode| enode.is_leaf()) {
                 return true;
             }
 
             visited.insert(eclass.id);
 
-            iterator.any(|enode| {
+            eclass.nodes.iter().filter(non_excluded).any(|enode| {
                 enode
                     .children()
                     .iter()
@@ -148,7 +149,7 @@ fn remove_top_enode<L: Language, N: Analysis<L>>(
     // Return early if undoing the top e-node would result in its e-class containing no ground term
     // (i.e. cannot be extracted)
     if !grounded(&egraph[eclass_id], &top_enode_instantiated, egraph) {
-        return Ok(false);
+        return Ok(None);
     }
 
     let eclass = &mut egraph[eclass_id];
@@ -166,7 +167,7 @@ fn remove_top_enode<L: Language, N: Analysis<L>>(
         }
     };
 
-    Ok(true)
+    Ok(Some(eclass_id))
 }
 
 pub fn remove_unreachable<L: Language, N: Analysis<L>>(
