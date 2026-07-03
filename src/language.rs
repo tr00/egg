@@ -963,16 +963,30 @@ pub fn merge_option<T>(
 /// });
 /// ```
 pub struct WeightedCost<L: Language> {
-    weight: Box<dyn Fn(&L) -> f64>,
+    /// The per-operator weight function.
+    pub weight: Box<dyn Fn(&L) -> f64>,
+    /// Temperature for stochastic acceptance gates. Read by
+    /// [`StochasticApplier`](crate::StochasticApplier) during `apply_one`.
+    /// Default: `1.0`. Set via [`with_temperature`](WeightedCost::with_temperature)
+    /// or mutate directly on the e-graph's analysis for simulated annealing.
+    pub temperature: f64,
 }
 
 impl<L: Language> WeightedCost<L> {
     /// Create a new `WeightedCost` from a function that returns the
     /// weight of each operator. Children costs are added automatically.
+    /// Temperature defaults to 1.0.
     pub fn new(weight: impl Fn(&L) -> f64 + 'static) -> Self {
         WeightedCost {
             weight: Box::new(weight),
+            temperature: 1.0,
         }
+    }
+
+    /// Set the initial temperature for stochastic acceptance.
+    pub fn with_temperature(mut self, temperature: f64) -> Self {
+        self.temperature = temperature;
+        self
     }
 }
 

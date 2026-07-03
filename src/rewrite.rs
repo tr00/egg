@@ -491,62 +491,96 @@ where
 /// let mut egraph = CostGraph::new(cost_fn);
 ///
 /// let rhs: Pattern<Math> = "(+ ?b ?a)".parse().unwrap();
-/// // Temperature = 1.0 means moderate exploration
-/// let applier = StochasticApplier::from_pattern_with_temperature(rhs, 1.0);
+/// // Temperature is set on the analysis, default 1.0
+/// let applier = StochasticApplier::from_pattern(rhs);
 /// ```
+/// Direction for the stochastic cost gate.
+///
+/// - `Add`: standard MH — accept cost-neutral/improving moves always,
+///   accept cost-worsening moves with probability exp(-Δcost/T).
+/// - `Remove`: complement — keep the best expression (Δcost=0 → prob=0),
+///   remove worse expressions with probability 1 - exp(-Δcost/T) where
+///   Δcost = pat_cost - eclass_cost ≥ 0.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StochasticDirection {
+    /// Gate for adding new expressions (standard MH).
+    Add,
+    /// Gate for removing existing expressions (complement of MH).
+    Remove,
+}
+
+/// An [`Applier`] that probabilistically gates application based on cost.
+///
+/// In `Add` direction (standard MH): accepts cost-neutral/improving moves
+/// always, cost-worsening moves with probability exp(-Δcost/T).
+///
+/// In `Remove` direction (complement): keeps the best expression in the
+/// e-class (prob=0 when Δcost=0), removes worse expressions with
+/// probability 1 - exp(-Δcost/T) where Δcost = pat_cost - eclass_cost.
+///
+/// Temperature is read from [`WeightedCost::temperature`] on the e-graph's
+/// analysis at apply time — one value shared across all rules. For simulated
+/// annealing, mutate it per iteration via a
+/// [`Runner::with_hook`](crate::Runner::with_hook).
 pub struct StochasticApplier<L: Language, A = Pattern<L>> {
     /// The pattern used for cost-checking. Instantiated to read costs
     /// before deciding whether to apply.
     pub pattern: Pattern<L>,
     /// The inner applier that performs the actual application.
     pub inner: A,
-    /// Temperature parameter controlling exploration/exploitation trade-off.
-    /// Higher values accept more cost increases; lower values are more selective.
-    pub temperature: f64,
+    /// Whether this applier is gating an add or remove operation.
+    pub direction: StochasticDirection,
 }
 
 impl<L: Language + FromOp> StochasticApplier<L> {
     /// Create a `StochasticApplier` from a single pattern. The pattern is
     /// used for both cost-checking and application (wraps itself as inner).
     pub fn from_pattern(pattern: Pattern<L>) -> Self {
-        Self::with_temperature(pattern.clone(), pattern, 1.0)
-    }
-
-    /// Create a `StochasticApplier` from a pattern with custom temperature.
-    pub fn from_pattern_with_temperature(pattern: Pattern<L>, temperature: f64) -> Self {
-        Self::with_temperature(pattern.clone(), pattern, temperature)
+        Self::new(pattern.clone(), pattern)
     }
 }
 
 impl<L: Language, A: Applier<L, WeightedCost<L>>> StochasticApplier<L, A> {
-    /// Create a new `StochasticApplier` wrapping an inner applier,
-    /// with default temperature of 1.0.
+    /// Create a new `StochasticApplier` wrapping an inner applier.
     pub fn new(pattern: Pattern<L>, inner: A) -> Self {
-        Self::with_temperature(pattern, inner, 1.0)
+        Self { pattern, inner, direction: StochasticDirection::Add }
     }
 
-    /// Create a `StochasticApplier` wrapping an inner applier
-    /// with a specific temperature.
-    pub fn with_temperature(pattern: Pattern<L>, inner: A, temperature: f64) -> Self {
-        Self { pattern, inner, temperature }
+    /// Create a `StochasticApplier` for a remove operation.
+    /// The cost gate keeps the best expression (prob=0) and removes worse ones
+    /// with probability `1 - exp(-Δcost/T)` where Δcost = pat_cost - eclass_cost.
+    pub fn new_remove(pattern: Pattern<L>, inner: A) -> Self {
+        Self { pattern, inner, direction: StochasticDirection::Remove }
     }
 }
 
-
 impl<L: Language, A> StochasticApplier<L, A> {
-    /// Compute acceptance probability using simulated annealing.
-    ///
-    /// Returns a probability in [0.0, 1.0] based on the cost difference:
-    /// - If new cost ≤ old cost: returns 1.0 (always accept improvements)
-    /// - If new cost > old cost: returns exp(-Δcost / temperature)
-    fn accept_probability(&self, old_cost: f64, new_cost: f64) -> f64 {
-        let delta = new_cost - old_cost;
-
-        if delta <= 0.0 {
-            1.0 // Always accept improvements
-        } else {
-            (-delta / self.temperature).exp() // Probabilistically accept regressions
+    /// Compute the cost of an already-instantiated pattern by summing
+    /// operator weights bottom-up, using child e-class costs for variables.
+    fn compute_pat_cost(
+        &self,
+        id_buf: &[Id],
+        egraph: &EGraph<L, WeightedCost<L>>,
+    ) -> Option<f64> {
+        let ast = &self.pattern.ast;
+        let mut cost_buf: Vec<Option<f64>> = vec![None; ast.len()];
+        for (i, enode_or_var) in ast.as_ref().iter().enumerate() {
+            cost_buf[i] = match enode_or_var {
+                ENodeOrVar::Var(_) => {
+                    let eclass_id = egraph.find(id_buf[i]);
+                    egraph[eclass_id].data
+                }
+                ENodeOrVar::ENode(enode) => {
+                    let w = (egraph.analysis.weight)(enode);
+                    let mut children_cost = 0.0_f64;
+                    for &child in enode.children() {
+                        children_cost += cost_buf[usize::from(child)]?;
+                    }
+                    Some(w + children_cost)
+                }
+            };
         }
+        cost_buf.last().copied().flatten()
     }
 }
 
@@ -567,34 +601,51 @@ where
         searcher_ast: Option<&PatternAst<L>>,
         rule_name: Symbol,
     ) -> Vec<Id> {
-        // Instantiate the pattern to make costs available
         let mut id_buf = vec![0.into(); self.pattern.ast.len()];
-        let new_id = apply_pat(&mut id_buf, &self.pattern.ast, egraph, subst);
+        let _new_id = apply_pat(&mut id_buf, &self.pattern.ast, egraph, subst);
 
-        // Read costs
         let eclass_canon = egraph.find(eclass);
-        let new_id_canon = egraph.find(new_id);
-        let old_cost = &egraph[eclass_canon].data;
-        let new_cost = &egraph[new_id_canon].data;
+        let eclass_cost = egraph[eclass_canon].data;
 
-        // Annealing gate
-        let accept = match (old_cost, new_cost) {
+        let pat_cost = self.compute_pat_cost(&id_buf, egraph);
+
+        // Read temperature from the analysis — one global value, mutated per
+        // iteration for simulated annealing.
+        let temp = egraph.analysis.temperature;
+
+        // Annealing gate — Metropolis-Hastings for Add, complement for Remove:
+        //
+        // delta = pat_cost - eclass_cost
+        //
+        // Add (standard MH):
+        //   delta ≤ 0  → always accept (improvement)
+        //   delta > 0  → accept with prob exp(-delta/T)
+        //
+        // Remove (complement):
+        //   delta ≤ 0  → never remove (expression is best or equal)
+        //   delta > 0  → remove with prob 1 - exp(-delta/T)
+        let accept = match (eclass_cost, pat_cost) {
             (Some(old), Some(new)) => {
-                let prob = self.accept_probability(*old, *new);
+                let delta = new - old;
+                let prob = match self.direction {
+                    StochasticDirection::Add => {
+                        if delta <= 0.0 { 1.0 } else { (-delta / temp).exp() }
+                    }
+                    StochasticDirection::Remove => {
+                        if delta <= 0.0 { 0.0 } else { 1.0 - (-delta / temp).exp() }
+                    }
+                };
                 let mut rng = rand::thread_rng();
                 let roll: f64 = rng.r#gen();
                 roll < prob
             }
-            // If costs are unavailable, accept by default (graceful degradation)
             _ => true,
         };
 
         if !accept {
-            // Pattern was instantiated but union rejected
             return vec![];
         }
 
-        // Delegate to inner applier
         self.inner.apply_one(egraph, eclass, subst, searcher_ast, rule_name)
     }
 

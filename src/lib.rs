@@ -100,7 +100,7 @@ pub use {
     language::*,
     multipattern::*,
     pattern::{ENodeOrVar, Pattern, PatternAst, SearchMatches},
-    rewrite::{Applier, Condition, ConditionEqual, ConditionalApplier, RemoveApplier, Rewrite, Searcher, StochasticApplier},
+    rewrite::{Applier, Condition, ConditionEqual, ConditionalApplier, RemoveApplier, Rewrite, Searcher, StochasticApplier, StochasticDirection},
     run::*,
     subst::{Subst, Var},
     undo::{remove_unreachable, undo_rewrites},

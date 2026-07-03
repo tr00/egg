@@ -258,3 +258,42 @@ fn stochastic_conditional_compose() {
     let expected = egraph.add_expr(&"(+ 2 1)".parse().unwrap());
     assert_eq!(egraph.find(root), egraph.find(expected));
 }
+
+/// Simulated annealing: temperature decays via analysis mutation in a hook.
+#[test]
+fn annealing_cooling() {
+    let searcher: Pattern<Expr> = "(+ ?a ?b)".parse().unwrap();
+    let rhs: Pattern<Expr> = "(+ ?b ?a)".parse().unwrap();
+
+    let applier = StochasticApplier::from_pattern(rhs);
+    let rw = Rewrite::new("commute-anneal", searcher, applier).unwrap();
+    let rules = &[rw];
+
+    let initial_temp = 10.0_f64;
+
+    let expr: RecExpr<Expr> = "(+ 1 2)".parse().unwrap();
+    let mut runner = Runner::<Expr, WeightedCost<Expr>>::new(
+        WeightedCost::new(weight).with_temperature(initial_temp),
+    )
+    .with_expr(&expr)
+    .with_iter_limit(5)
+    .with_hook(move |runner| {
+        runner.egraph.analysis.temperature *= 0.5;
+        Ok(())
+    })
+    .run(rules);
+
+    let iters = runner.iterations.len();
+    // After N iterations, temperature should be initial * 0.5^N
+    let final_temp = runner.egraph.analysis.temperature;
+    let expected = initial_temp * 0.5_f64.powi(iters as i32);
+    assert!((final_temp - expected).abs() < 1e-12,
+        "expected T={}, got T={} after {} iterations", expected, final_temp, iters);
+    assert!(final_temp < initial_temp);
+
+    // Saturation should still work
+    let root = runner.roots[0];
+    let egraph = &mut runner.egraph;
+    let expected_id = egraph.add_expr(&"(+ 2 1)".parse().unwrap());
+    assert_eq!(egraph.find(root), egraph.find(expected_id));
+}
