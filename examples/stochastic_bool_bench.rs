@@ -238,8 +238,13 @@ fn main() {
                 .with_expr(&expr)
                 .with_iter_limit(iter_limit)
                 .with_node_limit(node_limit)
+                .with_convergence()
                 .with_hook(move |runner| {
                     runner.egraph.analysis.temperature *= cr;
+                    runner
+                        .egraph
+                        .analysis
+                        .log_progress(&runner.egraph, runner.roots[0]);
                     Ok(())
                 })
                 .run(&rules);
@@ -255,6 +260,7 @@ fn main() {
             StopReason::NodeLimit(n) => format!("node_limit({n})"),
             StopReason::TimeLimit(t) => format!("time_limit({t:.1}s)"),
             StopReason::Other(s) => format!("other({s})"),
+            StopReason::Convergence(n) => format!("convergence({n})"),
         };
 
         println!(

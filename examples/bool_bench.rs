@@ -205,6 +205,7 @@ fn main() {
             StopReason::NodeLimit(n) => format!("node_limit({n})"),
             StopReason::TimeLimit(t) => format!("time_limit({t:.1}s)"),
             StopReason::Other(s) => format!("other({s})"),
+            StopReason::Convergence(n) => format!("convergence({n})"),
         };
 
         println!(

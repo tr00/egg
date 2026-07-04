@@ -866,6 +866,15 @@ pub trait Analysis<L: Language>: Sized {
     fn allow_ematching_cycles(&self) -> bool {
         true
     }
+
+    /// Return the cost of the best expression at `root`, if available.
+    ///
+    /// Used by [`Runner`](crate::Runner) for convergence detection.
+    /// The default returns `None`.
+    #[allow(unused_variables)]
+    fn cost(egraph: &EGraph<L, Self>, root: Id) -> Option<f64> {
+        None
+    }
 }
 
 impl<L: Language> Analysis<L> for () {
@@ -1037,6 +1046,37 @@ impl<L: Language> WeightedCost<L> {
         let expr = best.build_recexpr(find_best_node);
         Some((total, expr))
     }
+
+    /// Print a single-line progress summary to stderr.
+    ///
+    /// Shows: e-class count, e-node count, current temperature, and the
+    /// best cost extracted from `root`. Intended for use inside a
+    /// [`Runner::with_hook`](crate::Runner::with_hook) closure.
+    ///
+    /// # Example
+    /// ```ignore
+    /// .with_hook(|runner| {
+    ///     runner.egraph.analysis.log_progress(&runner.egraph, runner.roots[0]);
+    ///     Ok(())
+    /// })
+    /// ```
+    pub fn log_progress(&self, egraph: &EGraph<L, Self>, root: Id) {
+        let classes = egraph.number_of_classes();
+        let nodes = egraph.total_number_of_nodes();
+        let temp = self.temperature;
+        let root = egraph.find(root);
+        let cost = egraph[root].data;
+        match cost {
+            Some(cost) => eprintln!(
+                "iter | classes: {:>7} | nodes: {:>9} | T: {:>10.4} | cost: {cost:.4}",
+                classes, nodes, temp,
+            ),
+            None => eprintln!(
+                "iter | classes: {:>7} | nodes: {:>9} | T: {:>10.4} | cost:    n/a",
+                classes, nodes, temp,
+            ),
+        }
+    }
 }
 
 impl<L: Language> Analysis<L> for WeightedCost<L> {
@@ -1069,6 +1109,10 @@ impl<L: Language> Analysis<L> for WeightedCost<L> {
                 }
             }
         }
+    }
+
+    fn cost(egraph: &EGraph<L, Self>, root: Id) -> Option<f64> {
+        egraph[egraph.find(root)].data
     }
 }
 

@@ -154,6 +154,7 @@ pub struct Runner<L: Language, N: Analysis<L>, IterData = ()> {
     limits: RunnerLimits,
     scheduler: Box<dyn RewriteScheduler<L, N>>,
     gc: bool,
+    convergence: bool,
 }
 
 /// Describes the limits that would stop a [`Runner`].
@@ -217,6 +218,7 @@ where
             limits,
             scheduler: _,
             gc,
+            convergence,
         } = self;
 
         f.debug_struct("Runner")
@@ -228,6 +230,7 @@ where
             .field("limits", limits)
             .field("scheduler", &format_args!("<dyn RewriteScheduler ..>"))
             .field("gc", gc)
+            .field("convergence", convergence)
             .finish()
     }
 }
@@ -246,6 +249,9 @@ pub enum StopReason {
     NodeLimit(usize),
     /// The time limit was hit. The data is the time limit in seconds.
     TimeLimit(f64),
+    /// The cost has not improved for the configured number of iterations.
+    /// The data is the convergence window size.
+    Convergence(usize),
     /// Some other reason to stop.
     Other(String),
 }
@@ -327,10 +333,13 @@ pub struct Iteration<IterData> {
     pub total_time: f64,
     /// The user provided annotation for this iteration
     pub data: IterData,
-    /// The number of rebuild iterations done after this iteration completed.
-    pub n_rebuilds: usize,
     /// If the runner stopped on this iterations, this is the reason
     pub stop_reason: Option<StopReason>,
+    /// The number of rebuild iterations done after this iteration completed.
+    pub n_rebuilds: usize,
+    /// The cost of the best expression at the root, if available.
+    /// Set by the convergence mechanism; `None` if no cost function was provided.
+    pub cost: Option<f64>,
 }
 
 /// Type alias for the result of a [`Runner`].
@@ -345,19 +354,20 @@ where
     /// Create a new `Runner` with the given analysis and default parameters.
     pub fn new(analysis: N) -> Self {
         Self {
+            egraph: EGraph::new(analysis),
+            roots: vec![],
+            iterations: vec![],
+            stop_reason: None,
+            hooks: vec![],
             limits: RunnerLimits {
                 iter_limit: 30,
                 node_limit: 10_000,
                 time_limit: Duration::from_secs(5),
                 start_time: None,
             },
-            egraph: EGraph::new(analysis),
-            roots: vec![],
-            iterations: vec![],
-            stop_reason: None,
-            hooks: vec![],
             scheduler: Box::new(BackoffScheduler::default()),
             gc: false,
+            convergence: false,
         }
     }
 
@@ -446,6 +456,15 @@ where
         self
     }
 
+    /// Stop when the cost has stabilized for 3 consecutive iterations.
+    ///
+    /// The cost is read from [`Analysis::cost`](crate::Analysis::cost) each iteration.
+    /// If the analysis does not provide costs, convergence checking is silently skipped.
+    pub fn with_convergence(mut self) -> Self {
+        self.convergence = true;
+        self
+    }
+
     /// Run this `Runner` until it stops.
     /// After this, the field
     /// [`stop_reason`](Runner::stop_reason) is guaranteed to be
@@ -462,6 +481,29 @@ where
         loop {
             let iter = self.run_one(&rules);
             self.iterations.push(iter);
+
+            // Record cost from the analysis data at root, if available
+            if !self.roots.is_empty() {
+                let root = self.egraph.find(self.roots[0]);
+                self.iterations.last_mut().unwrap().cost = N::cost(&self.egraph, root);
+            }
+
+            // Check convergence: cost unchanged for 3 consecutive iterations
+            if self.convergence {
+                let n = self.iterations.len();
+                if n >= 3 {
+                    let costs: [Option<f64>; 3] = [
+                        self.iterations[n - 3].cost,
+                        self.iterations[n - 2].cost,
+                        self.iterations[n - 1].cost,
+                    ];
+                    if costs[0].is_some() && costs.windows(2).all(|w| w[0] == w[1]) {
+                        self.stop_reason = Some(StopReason::Convergence(3));
+                        break;
+                    }
+                }
+            }
+
             let stop_reason = self.iterations.last().unwrap().stop_reason.clone();
             // we need to check_limits after the iteration is complete to check for iter_limit
             if let Some(stop_reason) = stop_reason.or_else(|| self.check_limits().err()) {
@@ -675,6 +717,7 @@ where
             data: IterData::make(self),
             total_time: start_time.elapsed().as_secs_f64(),
             stop_reason: result.err(),
+            cost: None,
         }
     }
 

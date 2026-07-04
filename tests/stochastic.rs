@@ -279,6 +279,7 @@ fn annealing_cooling() {
     .with_iter_limit(5)
     .with_hook(move |runner| {
         runner.egraph.analysis.temperature *= 0.5;
+        runner.egraph.analysis.log_progress(&runner.egraph, runner.roots[0]);
         Ok(())
     })
     .run(rules);
